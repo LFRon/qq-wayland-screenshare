@@ -137,3 +137,7 @@ $HOME/.local/state/qq-xwayland-screencast/restore-token
 
 这是 QQ 专用兼容层，不替代 Xwayland 项目中通用的持续录屏实现。
 它也不会修改 QQ 文件、Xwayland 或 xdg-desktop-portal。
+
+## 广告
+
+该项目由 GPT-5.6 Sol(Max) 完成全部工作, 我只是喂了相关项目源码进去, 欢迎大佬们贡献各类PR
