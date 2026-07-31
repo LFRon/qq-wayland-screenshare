@@ -70,12 +70,17 @@ int
 main(int argc, char **argv)
 {
     const char *session_type;
-    void *module;
+    void *broadcast_module;
+    void *wrapper_module;
     probe_function untracked_xgetimage_untouched;
     probe_function captures_black;
+    probe_function partial_screenshot_untouched;
+    probe_function screenshot_is_black;
 
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s /path/to/broadcast-core.so\n", argv[0]);
+    if (argc != 3) {
+        fprintf(stderr,
+                "usage: %s /path/to/broadcast-core.so /path/to/wrapper.node\n",
+                argv[0]);
         return EXIT_FAILURE;
     }
 
@@ -89,37 +94,66 @@ main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    module = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
-    if (!module) {
-        fprintf(stderr, "dlopen failed: %s\n", dlerror());
+    broadcast_module = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+    if (!broadcast_module) {
+        fprintf(stderr, "broadcast-core dlopen failed: %s\n", dlerror());
         return EXIT_FAILURE;
     }
 
     untracked_xgetimage_untouched = load_probe(
-        module, "fake_broadcast_core_untracked_xgetimage_untouched");
-    captures_black = load_probe(module, "fake_broadcast_core_captures_black");
+        broadcast_module,
+        "fake_broadcast_core_untracked_xgetimage_untouched");
+    captures_black = load_probe(
+        broadcast_module, "fake_broadcast_core_captures_black");
     if (!untracked_xgetimage_untouched || !captures_black) {
         fprintf(stderr, "could not load fake broadcast-core probes\n");
-        dlclose(module);
+        dlclose(broadcast_module);
         return EXIT_FAILURE;
     }
 
     if (!untracked_xgetimage_untouched()) {
         fprintf(stderr,
                 "untracked broadcast-core XGetImage was intercepted\n");
-        dlclose(module);
+        dlclose(broadcast_module);
         return EXIT_FAILURE;
     }
     if (!captures_black()) {
         fprintf(stderr, "QQ X11 black-frame hooks failed\n");
-        dlclose(module);
+        dlclose(broadcast_module);
         return EXIT_FAILURE;
     }
 
-    dlclose(module);
+    dlclose(broadcast_module);
     if (!unrelated_xgetimage_is_untouched()) {
         fprintf(stderr, "QQ display remained tracked after XCloseDisplay\n");
         return EXIT_FAILURE;
     }
+
+    wrapper_module = dlopen(argv[2], RTLD_NOW | RTLD_LOCAL);
+    if (!wrapper_module) {
+        fprintf(stderr, "wrapper.node dlopen failed: %s\n", dlerror());
+        return EXIT_FAILURE;
+    }
+    partial_screenshot_untouched = load_probe(
+        wrapper_module, "fake_qq_wrapper_partial_xgetimage_untouched");
+    screenshot_is_black = load_probe(
+        wrapper_module, "fake_qq_wrapper_screenshot_is_black");
+    if (!partial_screenshot_untouched || !screenshot_is_black) {
+        fprintf(stderr, "could not load fake wrapper.node probes\n");
+        dlclose(wrapper_module);
+        return EXIT_FAILURE;
+    }
+    if (!partial_screenshot_untouched()) {
+        fprintf(stderr, "partial wrapper.node XGetImage was intercepted\n");
+        dlclose(wrapper_module);
+        return EXIT_FAILURE;
+    }
+    if (!screenshot_is_black()) {
+        fprintf(stderr, "rejected QQ portal screenshot was not black\n");
+        dlclose(wrapper_module);
+        return EXIT_FAILURE;
+    }
+
+    dlclose(wrapper_module);
     return EXIT_SUCCESS;
 }

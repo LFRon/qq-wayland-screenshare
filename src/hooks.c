@@ -8,6 +8,7 @@
  */
 
 #include "capture.h"
+#include "screenshot.h"
 
 #include <dlfcn.h>
 #include <pthread.h>
@@ -135,6 +136,12 @@ static bool
 caller_is_broadcast_core(void *return_address)
 {
     return caller_module_is(return_address, "broadcast-core.so");
+}
+
+static bool
+caller_is_qq_wrapper(void *return_address)
+{
+    return caller_module_is(return_address, "wrapper.node");
 }
 
 static bool
@@ -304,18 +311,61 @@ create_capture_image(Display *display, Drawable drawable,
     return image;
 }
 
+static bool
+is_qq_screenshot_request(Display *display, Drawable drawable,
+                         int x, int y,
+                         unsigned int width, unsigned int height,
+                         unsigned long plane_mask, int format,
+                         void *return_address)
+{
+    XWindowAttributes attributes;
+    int screen;
+
+    if (!display || !caller_is_qq_wrapper(return_address) ||
+        x != 0 || y != 0 || plane_mask != AllPlanes || format != ZPixmap)
+        return false;
+
+    screen = DefaultScreen(display);
+    if (drawable != RootWindow(display, screen))
+        return false;
+
+    ensure_real_functions();
+    if (!real_functions.xget_window_attributes ||
+        !real_functions.xget_window_attributes(display,
+                                               (Window) drawable,
+                                               &attributes))
+        return false;
+
+    return attributes.width > 0 && attributes.height > 0 &&
+           width == (unsigned int) attributes.width &&
+           height == (unsigned int) attributes.height;
+}
+
 QQ_PRELOAD_EXPORT XImage *
 XGetImage(Display *display, Drawable drawable, int x, int y,
           unsigned int width, unsigned int height,
           unsigned long plane_mask, int format)
 {
     XImage *image;
+    void *return_address = __builtin_return_address(0);
 
     if (display_is_tracked(display)) {
         image = create_capture_image(display, drawable,
                                      width, height, format);
         if (image)
             qq_capture_copy_to_ximage(image);
+        return image;
+    }
+
+    if (is_qq_screenshot_request(display, drawable, x, y,
+                                 width, height, plane_mask, format,
+                                 return_address)) {
+        image = create_capture_image(display, drawable,
+                                     width, height, format);
+        if (image)
+            qq_screenshot_copy_to_ximage(image);
+        hook_log("XGetImage redirected QQ screenshot to portal: %s",
+                 image ? "yes" : "image allocation failed");
         return image;
     }
 
@@ -346,6 +396,8 @@ static void __attribute__((destructor))
 qq_preload_shutdown(void)
 {
     struct tracked_display *entry;
+
+    qq_screenshot_shutdown();
 
     pthread_mutex_lock(&displays_mutex);
     entry = tracked_displays;

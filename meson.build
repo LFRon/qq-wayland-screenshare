@@ -12,6 +12,8 @@ project(
 cc = meson.get_compiler('c')
 
 dbus_dep = dependency('dbus-1')
+gdk_pixbuf_dep = dependency('gdk-pixbuf-2.0')
+gio_dep = dependency('gio-2.0')
 pipewire_dep = dependency('libpipewire-0.3')
 spa_dep = dependency('libspa-0.2')
 threads_dep = dependency('threads')
@@ -30,11 +32,15 @@ preload = shared_library(
     'src/capture.c',
     'src/frame.c',
     'src/hooks.c',
+    'src/portal.c',
+    'src/screenshot.c',
   ],
   c_args: common_c_args,
   dependencies: [
     dbus_dep,
     dl_dep,
+    gdk_pixbuf_dep,
+    gio_dep,
     pipewire_dep,
     spa_dep,
     threads_dep,
@@ -57,12 +63,69 @@ frame_test = executable(
 )
 test('frame conversion', frame_test)
 
+screenshot_test = executable(
+  'test-screenshot',
+  [
+    'src/frame.c',
+    'src/portal.c',
+    'src/screenshot.c',
+    'tests/test-screenshot.c',
+  ],
+  c_args: common_c_args,
+  include_directories: include_directories('src'),
+  dependencies: [
+    dbus_dep,
+    gdk_pixbuf_dep,
+    gio_dep,
+    spa_dep,
+    threads_dep,
+    x11_dep,
+  ],
+)
+test('screenshot conversion', screenshot_test)
+
+screenshot_portal_test = executable(
+  'test-screenshot-portal',
+  [
+    'src/frame.c',
+    'src/portal.c',
+    'src/screenshot.c',
+    'tests/test-screenshot-portal.c',
+  ],
+  c_args: common_c_args,
+  include_directories: include_directories('src'),
+  dependencies: [
+    dbus_dep,
+    gdk_pixbuf_dep,
+    gio_dep,
+    spa_dep,
+    threads_dep,
+    x11_dep,
+  ],
+)
+dbus_run_session = find_program('dbus-run-session')
+test(
+  'screenshot portal protocol',
+  dbus_run_session,
+  args: ['--', screenshot_portal_test],
+  timeout: 30,
+)
+
 fake_broadcast_core = shared_module(
   'broadcast-core',
   'tests/fake-broadcast-core.c',
   c_args: common_c_args,
   name_prefix: '',
   dependencies: [x11_dep, xext_dep],
+)
+
+fake_wrapper = shared_module(
+  'wrapper',
+  'tests/fake-wrapper.c',
+  c_args: common_c_args,
+  name_prefix: '',
+  name_suffix: 'node',
+  dependencies: [x11_dep],
 )
 
 hook_test = executable(
@@ -84,6 +147,7 @@ test(
     '-a',
     hook_test,
     fake_broadcast_core.full_path(),
+    fake_wrapper.full_path(),
   ],
   env: hook_test_env,
   timeout: 30,

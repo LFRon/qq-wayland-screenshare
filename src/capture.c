@@ -9,13 +9,13 @@
 
 #include "capture.h"
 #include "frame.h"
+#include "portal.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
 #include <stdarg.h>
-#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -38,23 +38,11 @@
 
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
-#define QQ_PORTAL_APP_ID "qq.xwayland"
-#define QQ_PORTAL_APP_NAME "QQ"
-
-#define PORTAL_BUS_NAME "org.freedesktop.portal.Desktop"
-#define PORTAL_OBJECT_PATH "/org/freedesktop/portal/desktop"
-#define PORTAL_SCREENCAST_IFACE "org.freedesktop.portal.ScreenCast"
-#define PORTAL_REQUEST_IFACE "org.freedesktop.portal.Request"
-#define PORTAL_SESSION_IFACE "org.freedesktop.portal.Session"
-#define PORTAL_PROPERTIES_IFACE "org.freedesktop.DBus.Properties"
-#define PORTAL_HOST_REGISTRY_IFACE "org.freedesktop.host.portal.Registry"
-
 #define PORTAL_SCREENCAST_SOURCE_MONITOR 1U
 #define PORTAL_SCREENCAST_CURSOR_HIDDEN 1U
 #define PORTAL_SCREENCAST_CURSOR_EMBEDDED 2U
 #define PORTAL_SCREENCAST_PERSIST_MODE_PERSISTENT 2U
 
-#define PORTAL_CALL_TIMEOUT_MS 3000
 #define PORTAL_CLOSE_TIMEOUT_MS 500
 #define FRAME_BYTES_PER_PIXEL 4U
 #define PIPEWIRE_BUFFER_TYPES \
@@ -100,7 +88,7 @@ struct capture_session {
     const char *stage;
 
     DBusConnection *connection;
-    char *response_match;
+    bool response_subscribed;
     char *session_handle;
     char *restore_token;
 
@@ -118,8 +106,6 @@ static struct capture_session capture = {
     .stage = "idle",
 };
 static pthread_mutex_t lifecycle_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_once_t dbus_threads_once = PTHREAD_ONCE_INIT;
-static atomic_uint token_serial;
 
 static bool
 environment_enabled(const char *name)
@@ -238,58 +224,6 @@ mkdir_p(const char *path, mode_t mode)
     }
 
     return mkdir(copy, mode) == 0 || errno == EEXIST;
-}
-
-static bool
-ensure_desktop_file(void)
-{
-    const char *xdg_data_home = getenv("XDG_DATA_HOME");
-    const char *home = getenv("HOME");
-    char applications_dir[PATH_MAX];
-    char desktop_path[PATH_MAX];
-    static const char contents[] =
-        "[Desktop Entry]\n"
-        "Type=Application\n"
-        "Name=QQ\n"
-        "Exec=true\n"
-        "NoDisplay=true\n"
-        "X-QQ-Xwayland-Screencast-Preload=true\n";
-    int length;
-    int fd;
-    bool ok;
-
-    if (xdg_data_home && xdg_data_home[0] == '/') {
-        length = snprintf(applications_dir, sizeof(applications_dir),
-                          "%s/applications", xdg_data_home);
-    } else if (home && home[0] == '/') {
-        length = snprintf(applications_dir, sizeof(applications_dir),
-                          "%s/.local/share/applications", home);
-    } else {
-        return false;
-    }
-    if (length < 0 || (size_t) length >= sizeof(applications_dir))
-        return false;
-    if (!mkdir_p(applications_dir, 0700))
-        return false;
-
-    length = snprintf(desktop_path, sizeof(desktop_path),
-                      "%s/%s.desktop", applications_dir, QQ_PORTAL_APP_ID);
-    if (length < 0 || (size_t) length >= sizeof(desktop_path))
-        return false;
-    if (access(desktop_path, F_OK) == 0)
-        return true;
-
-    fd = open(desktop_path,
-              O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
-              0644);
-    if (fd < 0)
-        return errno == EEXIST;
-
-    ok = write_full(fd, contents, sizeof(contents) - 1U);
-    close(fd);
-    if (!ok)
-        unlink(desktop_path);
-    return ok;
 }
 
 static bool
@@ -421,16 +355,6 @@ save_restore_token(const char *token)
     return ok;
 }
 
-static void
-make_token(char *buffer, size_t size, const char *prefix)
-{
-    unsigned int serial =
-        atomic_fetch_add_explicit(&token_serial, 1U, memory_order_relaxed) + 1U;
-
-    snprintf(buffer, size, "%s_%u_%u",
-             prefix, (unsigned int) getpid(), serial);
-}
-
 static bool
 session_stopped(struct capture_session *session)
 {
@@ -462,253 +386,6 @@ session_set_failed(struct capture_session *session)
     pthread_mutex_unlock(&session->mutex);
 }
 
-static bool
-append_dict_uint32(DBusMessageIter *dictionary,
-                   const char *key, uint32_t value)
-{
-    DBusMessageIter entry;
-    DBusMessageIter variant;
-    const char *key_value = key;
-
-    if (!dbus_message_iter_open_container(dictionary,
-                                          DBUS_TYPE_DICT_ENTRY,
-                                          NULL, &entry))
-        return false;
-    if (!dbus_message_iter_append_basic(&entry,
-                                        DBUS_TYPE_STRING,
-                                        &key_value))
-        return false;
-    if (!dbus_message_iter_open_container(&entry,
-                                          DBUS_TYPE_VARIANT,
-                                          "u", &variant))
-        return false;
-    if (!dbus_message_iter_append_basic(&variant,
-                                        DBUS_TYPE_UINT32,
-                                        &value))
-        return false;
-    if (!dbus_message_iter_close_container(&entry, &variant))
-        return false;
-    return dbus_message_iter_close_container(dictionary, &entry);
-}
-
-static bool
-append_dict_bool(DBusMessageIter *dictionary,
-                 const char *key, dbus_bool_t value)
-{
-    DBusMessageIter entry;
-    DBusMessageIter variant;
-    const char *key_value = key;
-
-    if (!dbus_message_iter_open_container(dictionary,
-                                          DBUS_TYPE_DICT_ENTRY,
-                                          NULL, &entry))
-        return false;
-    if (!dbus_message_iter_append_basic(&entry,
-                                        DBUS_TYPE_STRING,
-                                        &key_value))
-        return false;
-    if (!dbus_message_iter_open_container(&entry,
-                                          DBUS_TYPE_VARIANT,
-                                          "b", &variant))
-        return false;
-    if (!dbus_message_iter_append_basic(&variant,
-                                        DBUS_TYPE_BOOLEAN,
-                                        &value))
-        return false;
-    if (!dbus_message_iter_close_container(&entry, &variant))
-        return false;
-    return dbus_message_iter_close_container(dictionary, &entry);
-}
-
-static bool
-append_dict_string(DBusMessageIter *dictionary,
-                   const char *key, const char *value)
-{
-    DBusMessageIter entry;
-    DBusMessageIter variant;
-    const char *key_value = key;
-    const char *string_value = value;
-
-    if (!dbus_message_iter_open_container(dictionary,
-                                          DBUS_TYPE_DICT_ENTRY,
-                                          NULL, &entry))
-        return false;
-    if (!dbus_message_iter_append_basic(&entry,
-                                        DBUS_TYPE_STRING,
-                                        &key_value))
-        return false;
-    if (!dbus_message_iter_open_container(&entry,
-                                          DBUS_TYPE_VARIANT,
-                                          "s", &variant))
-        return false;
-    if (!dbus_message_iter_append_basic(&variant,
-                                        DBUS_TYPE_STRING,
-                                        &string_value))
-        return false;
-    if (!dbus_message_iter_close_container(&entry, &variant))
-        return false;
-    return dbus_message_iter_close_container(dictionary, &entry);
-}
-
-static DBusMessage *
-portal_call_with_timeout(DBusConnection *connection,
-                         DBusMessage *message,
-                         int timeout_ms)
-{
-    DBusError error;
-    DBusMessage *reply;
-
-    dbus_error_init(&error);
-    reply = dbus_connection_send_with_reply_and_block(connection,
-                                                      message,
-                                                      timeout_ms,
-                                                      &error);
-    dbus_message_unref(message);
-    if (dbus_error_is_set(&error)) {
-        capture_error("portal D-Bus call failed: %s", error.message);
-        dbus_error_free(&error);
-    }
-
-    return reply;
-}
-
-static DBusMessage *
-portal_call(DBusConnection *connection, DBusMessage *message)
-{
-    return portal_call_with_timeout(connection, message,
-                                    PORTAL_CALL_TIMEOUT_MS);
-}
-
-static bool
-portal_register_app_id(struct capture_session *session)
-{
-    DBusMessage *message;
-    DBusMessage *reply;
-    DBusMessageIter iter;
-    DBusMessageIter options;
-    const char *app_id = QQ_PORTAL_APP_ID;
-
-    if (!ensure_desktop_file())
-        capture_error("could not prepare %s.desktop", QQ_PORTAL_APP_ID);
-
-    message = dbus_message_new_method_call(PORTAL_BUS_NAME,
-                                           PORTAL_OBJECT_PATH,
-                                           PORTAL_HOST_REGISTRY_IFACE,
-                                           "Register");
-    if (!message)
-        return false;
-
-    dbus_message_iter_init_append(message, &iter);
-    if (!dbus_message_iter_append_basic(&iter,
-                                        DBUS_TYPE_STRING,
-                                        &app_id))
-        goto fail;
-    if (!dbus_message_iter_open_container(&iter,
-                                          DBUS_TYPE_ARRAY,
-                                          "{sv}", &options))
-        goto fail;
-    if (!dbus_message_iter_close_container(&iter, &options))
-        goto fail;
-
-    reply = portal_call(session->connection, message);
-    if (!reply)
-        return false;
-    if (dbus_message_get_type(reply) == DBUS_MESSAGE_TYPE_ERROR) {
-        const char *name = dbus_message_get_error_name(reply);
-
-        capture_error("portal rejected app id %s: %s",
-                      QQ_PORTAL_APP_ID,
-                      name ? name : "unknown D-Bus error");
-        dbus_message_unref(reply);
-        return false;
-    }
-
-    dbus_message_unref(reply);
-    return true;
-
-fail:
-    dbus_message_unref(message);
-    return false;
-}
-
-static char *
-portal_add_response_match(DBusConnection *connection)
-{
-    DBusMessage *message;
-    DBusMessage *reply;
-    char *rule;
-    const char *rule_value;
-    int length;
-
-    length = snprintf(NULL, 0,
-                      "type='signal',interface='%s',member='Response'",
-                      PORTAL_REQUEST_IFACE);
-    if (length < 0)
-        return NULL;
-
-    rule = malloc((size_t) length + 1U);
-    if (!rule)
-        return NULL;
-    snprintf(rule, (size_t) length + 1U,
-             "type='signal',interface='%s',member='Response'",
-             PORTAL_REQUEST_IFACE);
-
-    message = dbus_message_new_method_call(DBUS_SERVICE_DBUS,
-                                           DBUS_PATH_DBUS,
-                                           DBUS_INTERFACE_DBUS,
-                                           "AddMatch");
-    if (!message) {
-        free(rule);
-        return NULL;
-    }
-    rule_value = rule;
-    if (!dbus_message_append_args(message,
-                                  DBUS_TYPE_STRING, &rule_value,
-                                  DBUS_TYPE_INVALID)) {
-        dbus_message_unref(message);
-        free(rule);
-        return NULL;
-    }
-
-    reply = portal_call(connection, message);
-    if (!reply) {
-        free(rule);
-        return NULL;
-    }
-    if (dbus_message_get_type(reply) == DBUS_MESSAGE_TYPE_ERROR) {
-        const char *name = dbus_message_get_error_name(reply);
-
-        capture_error("could not subscribe to portal responses: %s",
-                      name ? name : "unknown D-Bus error");
-        dbus_message_unref(reply);
-        free(rule);
-        return NULL;
-    }
-    dbus_message_unref(reply);
-
-    return rule;
-}
-
-static void
-portal_close_request(DBusConnection *connection, const char *path)
-{
-    DBusMessage *message;
-    dbus_uint32_t serial = 0;
-
-    if (!connection || !path)
-        return;
-
-    message = dbus_message_new_method_call(PORTAL_BUS_NAME,
-                                           path,
-                                           PORTAL_REQUEST_IFACE,
-                                           "Close");
-    if (!message)
-        return;
-
-    dbus_connection_send(connection, message, &serial);
-    dbus_message_unref(message);
-}
-
 static DBusMessage *
 portal_wait_response(struct capture_session *session, const char *path)
 {
@@ -723,7 +400,7 @@ portal_wait_response(struct capture_session *session, const char *path)
             const char *message_path = dbus_message_get_path(message);
 
             if (dbus_message_is_signal(message,
-                                       PORTAL_REQUEST_IFACE,
+                                       QQ_PORTAL_REQUEST_IFACE,
                                        "Response") &&
                 message_path && strcmp(message_path, path) == 0) {
                 return message;
@@ -734,77 +411,7 @@ portal_wait_response(struct capture_session *session, const char *path)
     }
 
     if (session_stopped(session))
-        portal_close_request(connection, path);
-    return NULL;
-}
-
-static bool
-portal_response_success(DBusMessage *message,
-                        DBusMessageIter *results,
-                        uint32_t *response_out)
-{
-    DBusMessageIter iter;
-    uint32_t response;
-
-    if (response_out)
-        *response_out = UINT32_MAX;
-    if (!dbus_message_iter_init(message, &iter) ||
-        dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_UINT32)
-        return false;
-
-    dbus_message_iter_get_basic(&iter, &response);
-    if (response_out)
-        *response_out = response;
-    if (response != 0) {
-        capture_log("portal request returned response %u", response);
-        return false;
-    }
-
-    if (!dbus_message_iter_next(&iter) ||
-        dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_ARRAY)
-        return false;
-
-    *results = iter;
-    return true;
-}
-
-static char *
-response_lookup_string(DBusMessageIter *results, const char *wanted_key)
-{
-    DBusMessageIter dictionary;
-
-    dbus_message_iter_recurse(results, &dictionary);
-    while (dbus_message_iter_get_arg_type(&dictionary) ==
-           DBUS_TYPE_DICT_ENTRY) {
-        DBusMessageIter entry;
-        DBusMessageIter variant;
-        const char *key;
-        int value_type;
-
-        dbus_message_iter_recurse(&dictionary, &entry);
-        if (dbus_message_iter_get_arg_type(&entry) != DBUS_TYPE_STRING)
-            goto next;
-        dbus_message_iter_get_basic(&entry, &key);
-        if (strcmp(key, wanted_key) != 0)
-            goto next;
-        if (!dbus_message_iter_next(&entry) ||
-            dbus_message_iter_get_arg_type(&entry) != DBUS_TYPE_VARIANT)
-            goto next;
-
-        dbus_message_iter_recurse(&entry, &variant);
-        value_type = dbus_message_iter_get_arg_type(&variant);
-        if (value_type == DBUS_TYPE_STRING ||
-            value_type == DBUS_TYPE_OBJECT_PATH) {
-            const char *value;
-
-            dbus_message_iter_get_basic(&variant, &value);
-            return strdup(value);
-        }
-
-next:
-        dbus_message_iter_next(&dictionary);
-    }
-
+        qq_portal_close_request(connection, path);
     return NULL;
 }
 
@@ -815,13 +422,13 @@ portal_get_cursor_modes(DBusConnection *connection)
     DBusMessage *reply;
     DBusMessageIter iter;
     DBusMessageIter variant;
-    const char *interface_name = PORTAL_SCREENCAST_IFACE;
+    const char *interface_name = QQ_PORTAL_SCREENCAST_IFACE;
     const char *property_name = "AvailableCursorModes";
     uint32_t modes = 0;
 
-    message = dbus_message_new_method_call(PORTAL_BUS_NAME,
-                                           PORTAL_OBJECT_PATH,
-                                           PORTAL_PROPERTIES_IFACE,
+    message = dbus_message_new_method_call(QQ_PORTAL_BUS_NAME,
+                                           QQ_PORTAL_OBJECT_PATH,
+                                           QQ_PORTAL_PROPERTIES_IFACE,
                                            "Get");
     if (!message)
         return 0;
@@ -834,7 +441,7 @@ portal_get_cursor_modes(DBusConnection *connection)
                                    DBUS_TYPE_STRING,
                                    &property_name);
 
-    reply = portal_call(connection, message);
+    reply = qq_portal_call(connection, message);
     if (!reply)
         return 0;
 
@@ -862,12 +469,13 @@ portal_create_session(struct capture_session *session)
     char *request_path = NULL;
     char *session_handle = NULL;
 
-    make_token(handle_token, sizeof(handle_token), "qq_sc_create");
-    make_token(session_token, sizeof(session_token), "qq_sc_session");
+    qq_portal_make_token(handle_token, sizeof(handle_token), "qq_sc_create");
+    qq_portal_make_token(session_token, sizeof(session_token),
+                         "qq_sc_session");
 
-    message = dbus_message_new_method_call(PORTAL_BUS_NAME,
-                                           PORTAL_OBJECT_PATH,
-                                           PORTAL_SCREENCAST_IFACE,
+    message = dbus_message_new_method_call(QQ_PORTAL_BUS_NAME,
+                                           QQ_PORTAL_OBJECT_PATH,
+                                           QQ_PORTAL_SCREENCAST_IFACE,
                                            "CreateSession");
     if (!message)
         return NULL;
@@ -877,13 +485,15 @@ portal_create_session(struct capture_session *session)
                                           DBUS_TYPE_ARRAY,
                                           "{sv}", &options))
         goto fail;
-    if (!append_dict_string(&options, "handle_token", handle_token) ||
-        !append_dict_string(&options, "session_handle_token", session_token))
+    if (!qq_portal_append_dict_string(&options,
+                                      "handle_token", handle_token) ||
+        !qq_portal_append_dict_string(&options,
+                                      "session_handle_token", session_token))
         goto fail;
     if (!dbus_message_iter_close_container(&iter, &options))
         goto fail;
 
-    reply = portal_call(session->connection, message);
+    reply = qq_portal_call(session->connection, message);
     if (!reply)
         return NULL;
     if (!dbus_message_get_args(reply, NULL,
@@ -899,8 +509,9 @@ portal_create_session(struct capture_session *session)
     if (!response)
         return NULL;
 
-    if (portal_response_success(response, &results, NULL))
-        session_handle = response_lookup_string(&results, "session_handle");
+    if (qq_portal_response_success(response, &results, NULL))
+        session_handle =
+            qq_portal_response_lookup_string(&results, "session_handle");
     dbus_message_unref(response);
     return session_handle;
 
@@ -924,12 +535,12 @@ portal_select_sources(struct capture_session *session)
     uint32_t cursor_modes;
     bool ok;
 
-    make_token(handle_token, sizeof(handle_token), "qq_sc_select");
+    qq_portal_make_token(handle_token, sizeof(handle_token), "qq_sc_select");
     cursor_modes = portal_get_cursor_modes(session->connection);
 
-    message = dbus_message_new_method_call(PORTAL_BUS_NAME,
-                                           PORTAL_OBJECT_PATH,
-                                           PORTAL_SCREENCAST_IFACE,
+    message = dbus_message_new_method_call(QQ_PORTAL_BUS_NAME,
+                                           QQ_PORTAL_OBJECT_PATH,
+                                           QQ_PORTAL_SCREENCAST_IFACE,
                                            "SelectSources");
     if (!message)
         return false;
@@ -943,36 +554,40 @@ portal_select_sources(struct capture_session *session)
                                           DBUS_TYPE_ARRAY,
                                           "{sv}", &options))
         goto fail;
-    if (!append_dict_string(&options, "handle_token", handle_token) ||
-        !append_dict_uint32(&options, "types",
-                            PORTAL_SCREENCAST_SOURCE_MONITOR) ||
-        !append_dict_bool(&options, "multiple", FALSE))
+    if (!qq_portal_append_dict_string(&options,
+                                      "handle_token", handle_token) ||
+        !qq_portal_append_dict_uint32(&options, "types",
+                                      PORTAL_SCREENCAST_SOURCE_MONITOR) ||
+        !qq_portal_append_dict_bool(&options, "multiple", FALSE))
         goto fail;
 
     if (!environment_enabled("QQ_PRELOAD_DISABLE_PERSISTENCE")) {
-        if (!append_dict_uint32(&options, "persist_mode",
-                                PORTAL_SCREENCAST_PERSIST_MODE_PERSISTENT))
+        if (!qq_portal_append_dict_uint32(
+                &options, "persist_mode",
+                PORTAL_SCREENCAST_PERSIST_MODE_PERSISTENT))
             goto fail;
         if (session->restore_token &&
             restore_token_is_valid(session->restore_token) &&
-            !append_dict_string(&options, "restore_token",
-                                session->restore_token))
+            !qq_portal_append_dict_string(&options, "restore_token",
+                                          session->restore_token))
             goto fail;
     }
 
     if (cursor_modes & PORTAL_SCREENCAST_CURSOR_EMBEDDED) {
-        if (!append_dict_uint32(&options, "cursor_mode",
-                                PORTAL_SCREENCAST_CURSOR_EMBEDDED))
+        if (!qq_portal_append_dict_uint32(
+                &options, "cursor_mode",
+                PORTAL_SCREENCAST_CURSOR_EMBEDDED))
             goto fail;
     } else if (cursor_modes & PORTAL_SCREENCAST_CURSOR_HIDDEN) {
-        if (!append_dict_uint32(&options, "cursor_mode",
-                                PORTAL_SCREENCAST_CURSOR_HIDDEN))
+        if (!qq_portal_append_dict_uint32(
+                &options, "cursor_mode",
+                PORTAL_SCREENCAST_CURSOR_HIDDEN))
             goto fail;
     }
     if (!dbus_message_iter_close_container(&iter, &options))
         goto fail;
 
-    reply = portal_call(session->connection, message);
+    reply = qq_portal_call(session->connection, message);
     if (!reply)
         return false;
     if (!dbus_message_get_args(reply, NULL,
@@ -987,7 +602,7 @@ portal_select_sources(struct capture_session *session)
     dbus_message_unref(reply);
     if (!response)
         return false;
-    ok = portal_response_success(response, &results, NULL);
+    ok = qq_portal_response_success(response, &results, NULL);
     dbus_message_unref(response);
     return ok;
 
@@ -1076,11 +691,11 @@ portal_start(struct capture_session *session)
     char *restore_token = NULL;
     bool ok = false;
 
-    make_token(handle_token, sizeof(handle_token), "qq_sc_start");
+    qq_portal_make_token(handle_token, sizeof(handle_token), "qq_sc_start");
 
-    message = dbus_message_new_method_call(PORTAL_BUS_NAME,
-                                           PORTAL_OBJECT_PATH,
-                                           PORTAL_SCREENCAST_IFACE,
+    message = dbus_message_new_method_call(QQ_PORTAL_BUS_NAME,
+                                           QQ_PORTAL_OBJECT_PATH,
+                                           QQ_PORTAL_SCREENCAST_IFACE,
                                            "Start");
     if (!message)
         return false;
@@ -1097,12 +712,13 @@ portal_start(struct capture_session *session)
                                           DBUS_TYPE_ARRAY,
                                           "{sv}", &options))
         goto fail;
-    if (!append_dict_string(&options, "handle_token", handle_token))
+    if (!qq_portal_append_dict_string(&options,
+                                      "handle_token", handle_token))
         goto fail;
     if (!dbus_message_iter_close_container(&iter, &options))
         goto fail;
 
-    reply = portal_call(session->connection, message);
+    reply = qq_portal_call(session->connection, message);
     if (!reply)
         return false;
     if (!dbus_message_get_args(reply, NULL,
@@ -1118,11 +734,11 @@ portal_start(struct capture_session *session)
     if (!response)
         return false;
 
-    if (portal_response_success(response, &results, NULL)) {
+    if (qq_portal_response_success(response, &results, NULL)) {
         ok = parse_streams(&results, session);
         if (ok)
             restore_token =
-                response_lookup_string(&results, "restore_token");
+                qq_portal_response_lookup_string(&results, "restore_token");
     }
 
     if (ok && !environment_enabled("QQ_PRELOAD_DISABLE_PERSISTENCE")) {
@@ -1156,9 +772,9 @@ portal_open_pipewire_remote(struct capture_session *session)
     const char *session_handle = session->session_handle;
     int fd = -1;
 
-    message = dbus_message_new_method_call(PORTAL_BUS_NAME,
-                                           PORTAL_OBJECT_PATH,
-                                           PORTAL_SCREENCAST_IFACE,
+    message = dbus_message_new_method_call(QQ_PORTAL_BUS_NAME,
+                                           QQ_PORTAL_OBJECT_PATH,
+                                           QQ_PORTAL_SCREENCAST_IFACE,
                                            "OpenPipeWireRemote");
     if (!message)
         return -1;
@@ -1175,7 +791,7 @@ portal_open_pipewire_remote(struct capture_session *session)
     if (!dbus_message_iter_close_container(&iter, &options))
         goto fail;
 
-    reply = portal_call(session->connection, message);
+    reply = qq_portal_call(session->connection, message);
     if (!reply)
         return -1;
     if (!dbus_message_get_args(reply, NULL,
@@ -1637,32 +1253,24 @@ pipewire_cleanup(struct capture_session *session)
 static bool
 portal_connect(struct capture_session *session)
 {
-    DBusError error;
     int fd;
 
     session_set_stage(session, "connecting to session bus");
-    dbus_error_init(&error);
-    session->connection = dbus_bus_get_private(DBUS_BUS_SESSION, &error);
-    if (!session->connection) {
-        if (dbus_error_is_set(&error)) {
-            capture_error("could not connect to session bus: %s",
-                          error.message);
-            dbus_error_free(&error);
-        }
+    session->connection = qq_portal_connect_session_bus();
+    if (!session->connection)
         return false;
-    }
-    dbus_connection_set_exit_on_disconnect(session->connection, false);
     if (session_stopped(session))
         return false;
 
     session_set_stage(session, "registering QQ portal identity");
-    if (!portal_register_app_id(session) || session_stopped(session))
+    if (!qq_portal_register_app_id(session->connection) ||
+        session_stopped(session))
         return false;
 
     session_set_stage(session, "subscribing to portal responses");
-    session->response_match =
-        portal_add_response_match(session->connection);
-    if (!session->response_match || session_stopped(session))
+    session->response_subscribed =
+        qq_portal_add_response_match(session->connection);
+    if (!session->response_subscribed || session_stopped(session))
         return false;
 
     session_set_stage(session, "creating portal session");
@@ -1703,14 +1311,14 @@ portal_cleanup(struct capture_session *session)
         DBusMessage *reply;
         const char *session_handle = session->session_handle;
 
-        message = dbus_message_new_method_call(PORTAL_BUS_NAME,
+        message = dbus_message_new_method_call(QQ_PORTAL_BUS_NAME,
                                                session_handle,
-                                               PORTAL_SESSION_IFACE,
+                                               QQ_PORTAL_SESSION_IFACE,
                                                "Close");
         if (message) {
-            reply = portal_call_with_timeout(session->connection,
-                                             message,
-                                             PORTAL_CLOSE_TIMEOUT_MS);
+            reply = qq_portal_call_with_timeout(session->connection,
+                                                message,
+                                                PORTAL_CLOSE_TIMEOUT_MS);
             if (reply)
                 dbus_message_unref(reply);
         }
@@ -1719,15 +1327,9 @@ portal_cleanup(struct capture_session *session)
     free(session->session_handle);
     session->session_handle = NULL;
 
-    if (session->connection) {
-        if (session->response_match) {
-            free(session->response_match);
-            session->response_match = NULL;
-        }
-        dbus_connection_close(session->connection);
-        dbus_connection_unref(session->connection);
-        session->connection = NULL;
-    }
+    session->response_subscribed = false;
+    qq_portal_disconnect(session->connection);
+    session->connection = NULL;
 }
 
 static void *
@@ -1758,12 +1360,6 @@ capture_thread(void *data)
     return NULL;
 }
 
-static void
-initialize_dbus_threads(void)
-{
-    dbus_threads_init_default();
-}
-
 bool
 qq_capture_acquire(void)
 {
@@ -1785,12 +1381,15 @@ qq_capture_acquire(void)
         capture.stage = "starting";
         free(capture.restore_token);
         capture.restore_token = load_restore_token();
-        pthread_once(&dbus_threads_once, initialize_dbus_threads);
 
-        if (pthread_create(&capture.thread,
-                           NULL,
-                           capture_thread,
-                           &capture) != 0) {
+        if (!qq_portal_initialize_threads()) {
+            capture.failed = true;
+            capture.stage = "D-Bus thread initialization failed";
+            ok = false;
+        } else if (pthread_create(&capture.thread,
+                                  NULL,
+                                  capture_thread,
+                                  &capture) != 0) {
             capture.failed = true;
             capture.stage = "thread creation failed";
             ok = false;
